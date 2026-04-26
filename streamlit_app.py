@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import heapq
+import time
 from pathlib import Path
 
 import networkx as nx
@@ -45,6 +47,17 @@ def _init_state() -> None:
         st.session_state.last_dfs_path = []
     if "auto_loaded_graph" not in st.session_state:
         st.session_state.auto_loaded_graph = False
+    # Animation state
+    if "animation_steps" not in st.session_state:
+        st.session_state.animation_steps = []
+    if "animation_type" not in st.session_state:
+        st.session_state.animation_type = ""
+    if "animation_start" not in st.session_state:
+        st.session_state.animation_start = ""
+    if "animation_end" not in st.session_state:
+        st.session_state.animation_end = ""
+    if "animation_pos" not in st.session_state:
+        st.session_state.animation_pos = {}
 
 
 def _inject_css() -> None:
@@ -105,6 +118,22 @@ def _inject_css() -> None:
             background: #ffffff;
             margin-top: 0.5rem;
             overflow: hidden;
+        }
+        .anim-shell {
+            border: 1px solid #fbbf24;
+            border-radius: 14px;
+            padding: 0.45rem;
+            background: #fffbeb;
+            margin-top: 0.5rem;
+            overflow: hidden;
+        }
+        .legend-chip {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            margin: 2px 3px;
         }
         .section-title {font-weight: 700; font-size: 1.02rem; color: #0f172a; margin-bottom: 0.55rem;}
         .mini-caption {color: #64748b; font-size: 0.9rem;}
@@ -182,12 +211,15 @@ def _load_graph_from_csv(
     for _, row in edges_df.iterrows():
         source = str(row["from"]).strip()
         target = str(row["to"]).strip()
+        dist = float(row.get("distance", 1.0)) if "distance" in row else 1.0
+        time_val = float(row.get("time", 1.0)) if "time" in row else 1.0
         if source and target:
-            graph.add_edge(source, target)
+            graph.add_edge(source, target, distance=dist, time=time_val)
+            graph.add_edge(target, source, distance=dist, time=time_val)
 
     st.session_state.graph = graph
     if show_feedback:
-        st.success("Graph directed berhasil dimuat dari CSV.")
+        st.success("Graph berhasil dimuat dari CSV (Bidirectional/Undirected).")
     return True
 
 
@@ -205,43 +237,249 @@ def _save_history_to_csv(history_path: Path) -> None:
     pd.DataFrame(rows).to_csv(history_path, index=False)
 
 
-def _run_bfs(start: str, end: str) -> None:
+# ---------------------------------------------------------------------------
+# Algorithm step computation (for animation)
+# ---------------------------------------------------------------------------
+
+def _compute_dijkstra_steps(
+    graph: nx.DiGraph, start: str, end: str, criteria: str
+) -> tuple[list[dict], list[str], float, float]:
+    """Run Dijkstra step-by-step, collecting animation frames.
+
+    Returns (steps, path, total_distance, total_time).
+    """
+    pq: list[tuple[float, str]] = [(0.0, start)]
+    min_weights: dict[str, float] = {start: 0.0}
+    parent: dict[str, str | None] = {start: None}
+    visited: set[str] = set()
+    steps: list[dict] = []
+
+    while pq:
+        w, node = heapq.heappop(pq)
+        if node in visited:
+            continue
+        visited.add(node)
+
+        # Reconstruct path to current node
+        path_to_node: list[str] = []
+        cur: str | None = node
+        while cur is not None:
+            path_to_node.append(cur)
+            cur = parent.get(cur)
+        path_to_node.reverse()
+
+        path_edges = {
+            (path_to_node[i], path_to_node[i + 1])
+            for i in range(len(path_to_node) - 1)
+        }
+        frontier = {n for _, n in pq if n not in visited}
+
+        steps.append({
+            "visited": set(visited),
+            "current": node,
+            "frontier": frontier,
+            "path_edges": path_edges,
+            "current_path": path_to_node,
+            "message": (
+                f"Dijkstra: memproses '{node}' (cost={round(w, 1)}) | "
+                f"Path sejauh ini: {' → '.join(path_to_node)}"
+            ),
+        })
+
+        if node == end:
+            break
+
+        for neighbor in graph.successors(node):
+            edge_data = graph[node][neighbor]
+            edge_w = float(edge_data.get(criteria, 1.0))
+            new_w = w + edge_w
+            if new_w < min_weights.get(neighbor, float("inf")):
+                min_weights[neighbor] = new_w
+                parent[neighbor] = node
+                heapq.heappush(pq, (new_w, neighbor))
+
+    # Reconstruct final path
+    if end in parent:
+        path: list[str] = []
+        cur2: str | None = end
+        while cur2 is not None:
+            path.append(cur2)
+            cur2 = parent.get(cur2)
+        path.reverse()
+        total_dist = sum(
+            graph[u][v].get("distance", 1.0) for u, v in zip(path[:-1], path[1:])
+        )
+        total_time = sum(
+            graph[u][v].get("time", 1.0) for u, v in zip(path[:-1], path[1:])
+        )
+    else:
+        path = []
+        total_dist = 0.0
+        total_time = 0.0
+
+    return steps, path, round(total_dist, 1), round(total_time, 1)
+
+
+def _compute_dfs_steps(
+    graph: nx.DiGraph, start: str, end: str | None = None
+) -> tuple[list[dict], list[str]]:
+    """Run DFS step-by-step, collecting animation frames.
+
+    If `end` is given, stops when end node is reached (pathfinding mode).
+    Returns (steps, result_path).
+    """
+    stack: list[tuple[str, list[str]]] = [(start, [start])]
+    visited: set[str] = set()
+    steps: list[dict] = []
+    result_path: list[str] = []
+
+    while stack:
+        node, path = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+
+        path_edges = {(path[i], path[i + 1]) for i in range(len(path) - 1)}
+        stack_nodes = {n for n, _ in stack if n not in visited}
+
+        steps.append({
+            "visited": set(visited),
+            "current": node,
+            "frontier": stack_nodes,
+            "path_edges": path_edges,
+            "current_path": list(path),
+            "message": (
+                f"DFS: mengunjungi '{node}' | "
+                f"Path saat ini: {' → '.join(path)}"
+            ),
+        })
+
+        if end and node == end:
+            result_path = list(path)
+            break
+
+        for neighbor in reversed(list(graph.successors(node))):
+            if neighbor not in visited:
+                stack.append((neighbor, path + [neighbor]))
+
+    if not end:
+        result_path = [s["current"] for s in steps]
+
+    return steps, result_path
+
+
+# ---------------------------------------------------------------------------
+# Algorithm runners
+# ---------------------------------------------------------------------------
+
+def _run_bfs(start: str, end: str, criteria: str = "distance") -> None:
     graph = st.session_state.graph
     if not graph.has_node(start) or not graph.has_node(end):
         st.warning("Node start/end tidak ditemukan pada graph.")
         return
 
-    try:
-        path = nx.shortest_path(graph, start, end)
-    except nx.NetworkXNoPath:
+    steps, path, total_dist, total_time = _compute_dijkstra_steps(
+        graph, start, end, criteria
+    )
+
+    if not path:
         st.warning(f"Tidak ada path dari {start} ke {end}.")
         return
 
     path_text = "-".join(path)
-    distance = len(path) - 1
     st.session_state.history.append(path_text)
     st.session_state.results.append(
-        {"start": start, "end": end, "path": path_text, "distance": distance}
+        {
+            "start": start,
+            "end": end,
+            "path": path_text,
+            "distance": total_dist,
+            "time": total_time,
+        }
     )
     st.session_state.last_bfs_path = path
     st.session_state.highlight_path_edges = {
         (path[i], path[i + 1]) for i in range(len(path) - 1)
     }
-    st.success(f"BFS path: {' -> '.join(path)} | distance={distance}")
+
+    # Store animation data
+    st.session_state.animation_steps = steps
+    st.session_state.animation_type = f"BFS / Dijkstra (optimasi: {criteria})"
+    st.session_state.animation_start = start
+    st.session_state.animation_end = end
+    pos = nx.spring_layout(graph, seed=42)
+    st.session_state.animation_pos = {
+        n: (float(xy[0]), float(xy[1])) for n, xy in pos.items()
+    }
+
+    st.success(
+        f"Optimal path ({criteria}): {' → '.join(path)} "
+        f"| dist={total_dist}, time={total_time}"
+    )
 
 
-def _run_dfs(start: str) -> None:
+def _run_dfs(start: str, end: str | None = None, criteria: str = "distance") -> None:
     graph = st.session_state.graph
     if not graph.has_node(start):
         st.warning("Node start DFS tidak ditemukan.")
         return
+    if end and not graph.has_node(end):
+        st.warning("Node end DFS tidak ditemukan.")
+        return
 
-    path = list(nx.dfs_preorder_nodes(graph, source=start))
+    steps, path = _compute_dfs_steps(graph, start, end if end else None)
+
+    if end and not path:
+        st.warning(f"DFS tidak menemukan path dari {start} ke {end}.")
+        return
+
+    path_text = "-".join(path)
+    total_dist = 0.0
+    total_time = 0.0
+
+    if end and len(path) > 1:
+        total_dist = round(
+            sum(graph[u][v].get("distance", 1.0) for u, v in zip(path[:-1], path[1:])), 1
+        )
+        total_time = round(
+            sum(graph[u][v].get("time", 1.0) for u, v in zip(path[:-1], path[1:])), 1
+        )
+
+    st.session_state.history.append(path_text)
+    if end:
+        st.session_state.results.append(
+            {
+                "start": start,
+                "end": end,
+                "path": path_text,
+                "distance": total_dist,
+                "time": total_time,
+            }
+        )
     st.session_state.last_dfs_path = path
     st.session_state.highlight_path_edges = {
         (path[i], path[i + 1]) for i in range(len(path) - 1)
     }
-    st.success(f"DFS order: {' -> '.join(path)}")
+
+    # Store animation data
+    st.session_state.animation_steps = steps
+    st.session_state.animation_type = (
+        f"DFS Pathfinding ({criteria})" if end else "DFS Exploration"
+    )
+    st.session_state.animation_start = start
+    st.session_state.animation_end = end or ""
+    pos = nx.spring_layout(graph, seed=42)
+    st.session_state.animation_pos = {
+        n: (float(xy[0]), float(xy[1])) for n, xy in pos.items()
+    }
+
+    if end:
+        st.success(
+            f"DFS path ({criteria}): {' → '.join(path)} "
+            f"| dist={total_dist}, time={total_time}"
+        )
+    else:
+        st.success(f"DFS traversal order: {' → '.join(path)}")
 
 
 def _run_batch_query(query_path: Path, result_path: Path) -> None:
@@ -295,6 +533,10 @@ def _run_batch_query(query_path: Path, result_path: Path) -> None:
     st.success(f"Batch query selesai: {ok_count} result disimpan, {skip_count} query di-skip.")
 
 
+# ---------------------------------------------------------------------------
+# Graph visualization builders
+# ---------------------------------------------------------------------------
+
 def _degree_category(total_degree: int) -> tuple[str, str]:
     if total_degree >= 4:
         return "high", "#ef4444"
@@ -322,7 +564,7 @@ def _build_agraph(
         st.info("Graph kosong setelah filter degree.")
         return None
 
-    highlight_edges = set()
+    highlight_edges: set[tuple[str, str]] = set()
     if highlight_mode == "path":
         highlight_edges = set(st.session_state.highlight_path_edges)
     elif highlight_mode == "neighbors" and selected_node and selected_node in subgraph:
@@ -373,20 +615,24 @@ def _build_agraph(
             width = 4
         elif selected_node:
             if source == selected_node:
-                color = "#2563eb"  # outgoing
+                color = "#2563eb"
                 width = 2.5
             elif target == selected_node:
-                color = "#dc2626"  # incoming
+                color = "#dc2626"
                 width = 2.5
+
+        dist = subgraph[source][target].get("distance", 1.0)
+        time_val = subgraph[source][target].get("time", 1.0)
+        label = f"d:{dist}, t:{time_val}"
 
         edges.append(
             Edge(
                 source=source,
                 target=target,
-                label="",
+                label=label,
                 color=color,
                 width=width,
-                title=f"Relasi: {source} -> {target}",
+                title=f"Relasi: {source} -> {target} | d:{dist}, t:{time_val}",
                 smooth=False,
             )
         )
@@ -407,6 +653,89 @@ def _build_agraph(
     clicked_node = agraph(nodes=nodes, edges=edges, config=config)
     return clicked_node
 
+
+def _build_agraph_for_animation(
+    graph: nx.DiGraph,
+    step: dict,
+    start: str,
+    end: str,
+    pos: dict[str, tuple[float, float]] | None = None,
+    height: int = 320,
+    step_idx: str | int = 0,
+) -> None:
+    """Build an agraph frame for a single animation step."""
+    visited = step.get("visited", set())
+    current = step.get("current", "")
+    frontier = step.get("frontier", set())
+    path_edges = step.get("path_edges", set())
+
+    nodes = []
+    for node in graph.nodes():
+        if node == current:
+            color, size = "#f59e0b", 24
+        elif node == start and node != current:
+            color, size = "#8b5cf6", 22
+        elif end and node == end and node != current:
+            color, size = "#ef4444", 22
+        elif node in visited:
+            color, size = "#22c55e", 18
+        elif node in frontier:
+            color, size = "#3b82f6", 18
+        else:
+            color, size = "#cbd5e1", 15
+
+        node_kwargs = {
+            "id": node,
+            "label": node,
+            "size": size,
+            "color": color,
+            "shape": "dot",
+            "title": f"{node}",
+            "font": {"color": "#0f172a", "size": 11},
+        }
+        if pos and node in pos:
+            node_kwargs["x"] = pos[node][0] * 300
+            node_kwargs["y"] = pos[node][1] * 300
+            node_kwargs["fixed"] = True
+
+        nodes.append(Node(**node_kwargs))
+
+    edges = []
+    for src, tgt in graph.edges():
+        if (src, tgt) in path_edges:
+            color, width = "#f97316", 4
+        elif src in visited and tgt in visited:
+            color, width = "#86efac", 2
+        else:
+            color, width = "#e2e8f0", 1
+
+        edges.append(
+            Edge(
+                source=src,
+                target=tgt,
+                color=color,
+                width=width,
+                smooth=False,
+            )
+        )
+
+    config = Config(
+        width="100%",
+        height=height,
+        directed=True,
+        physics=False,
+        hierarchical=False,
+        staticGraph=True,
+        step_id=step_idx,
+    )
+
+    agraph(nodes=nodes, edges=edges, config=config)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     _init_state()
     _inject_css()
@@ -421,8 +750,8 @@ def main() -> None:
     with left_col:
         with st.expander("Data Source & File Paths", expanded=True):
             st.markdown('<div class="panel-box">', unsafe_allow_html=True)
-            nodes_path_raw = st.text_input("Nodes CSV", "data/nodes.csv")
-            edges_path_raw = st.text_input("Edges CSV", "data/edges.csv")
+            nodes_path_raw = st.text_input("Nodes CSV", "data/krl/nodes.csv")
+            edges_path_raw = st.text_input("Edges CSV", "data/krl/edges.csv")
             query_path_raw = st.text_input("Query CSV", "data/query.csv")
             result_path_raw = st.text_input("Result CSV", "output/result.csv")
             history_path_raw = st.text_input("History CSV", "output/history.csv")
@@ -443,10 +772,10 @@ def main() -> None:
                 st.session_state.auto_loaded_graph = True
 
             c_load, c_reset = st.columns(2)
-            
-            if c_load.button("Load CSV", use_container_width=True):
+
+            if c_load.button("Load CSV", width="stretch"):
                 _load_graph_from_csv(nodes_path, edges_path)
-            if c_reset.button("Reset Graph", use_container_width=True):
+            if c_reset.button("Reset Graph", width="stretch"):
                 st.session_state.graph = nx.DiGraph()
                 st.session_state.history = []
                 st.session_state.results = []
@@ -454,6 +783,7 @@ def main() -> None:
                 st.session_state.last_bfs_path = []
                 st.session_state.last_dfs_path = []
                 st.session_state.selected_node = None
+                st.session_state.animation_steps = []
                 st.success("State graph direset.")
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -461,7 +791,7 @@ def main() -> None:
             st.markdown('<div class="panel-box">', unsafe_allow_html=True)
             with st.form("add_node_form", clear_on_submit=True):
                 node_name = st.text_input("Tambah Node")
-                submit_node = st.form_submit_button("Add Node", use_container_width=True)
+                submit_node = st.form_submit_button("Add Node", width="stretch")
                 if submit_node:
                     name = node_name.strip()
                     if not name:
@@ -473,7 +803,7 @@ def main() -> None:
             with st.form("add_edge_form", clear_on_submit=True):
                 edge_source = st.text_input("Edge Source (from)")
                 edge_target = st.text_input("Edge Target (to)")
-                submit_edge = st.form_submit_button("Add Directed Edge", use_container_width=True)
+                submit_edge = st.form_submit_button("Add Directed Edge", width="stretch")
                 if submit_edge:
                     source = edge_source.strip()
                     target = edge_target.strip()
@@ -489,30 +819,60 @@ def main() -> None:
         graph_nodes = sorted(st.session_state.graph.nodes())
         node_options = [""] + graph_nodes
 
-        with st.expander("Algorithms", expanded=False):
+        with st.expander("Algorithms", expanded=True):
             st.markdown('<div class="panel-box">', unsafe_allow_html=True)
-            bfs_col1, bfs_col2 = st.columns(2)
-            bfs_start = bfs_col1.selectbox("BFS Start", node_options, key="bfs_start")
-            bfs_end = bfs_col2.selectbox("BFS End", node_options, key="bfs_end")
-            if st.button("Run BFS", use_container_width=True):
-                if not bfs_start or not bfs_end:
-                    st.warning("Pilih node start dan end untuk BFS.")
-                else:
-                    _run_bfs(bfs_start, bfs_end)
 
-            dfs_start = st.selectbox("DFS Start", node_options, key="dfs_start")
-            if st.button("Run DFS", use_container_width=True):
+            # --- BFS / Dijkstra ---
+            st.markdown("**Find Optimal Path (BFS / Dijkstra)**")
+            bfs_col1, bfs_col2 = st.columns(2)
+            bfs_start = bfs_col1.selectbox("Start Node", node_options, key="bfs_start")
+            bfs_end = bfs_col2.selectbox("End Node", node_options, key="bfs_end")
+            criteria = st.radio("Optimize By", options=["distance", "time"], horizontal=True)
+
+            if st.button("Find Optimal Path", width="stretch", type="primary"):
+                if not bfs_start or not bfs_end:
+                    st.warning("Pilih node start dan end.")
+                else:
+                    _run_bfs(bfs_start, bfs_end, criteria=criteria)
+
+            st.divider()
+
+            # --- DFS ---
+            st.markdown("**DFS (Depth-First Search)**")
+            dfs_col1, dfs_col2 = st.columns(2)
+            dfs_start = dfs_col1.selectbox("DFS Start", node_options, key="dfs_start")
+            dfs_end = dfs_col2.selectbox(
+                "DFS End (opsional)",
+                node_options,
+                key="dfs_end",
+                help="Kosongkan untuk mode eksplorasi penuh. Isi untuk DFS pathfinding ke node tujuan.",
+            )
+            dfs_criteria = st.radio(
+                "DFS Metric (untuk tampilkan distance/time)",
+                options=["distance", "time"],
+                horizontal=True,
+                key="dfs_criteria",
+            )
+
+            if st.button("Run DFS", width="stretch"):
                 if not dfs_start:
                     st.warning("Pilih node start untuk DFS.")
                 else:
-                    _run_dfs(dfs_start)
+                    _run_dfs(
+                        dfs_start,
+                        end=dfs_end if dfs_end else None,
+                        criteria=dfs_criteria,
+                    )
 
-            if st.button("Run Batch Query + Save Result", use_container_width=True):
+            st.divider()
+
+            if st.button("Run Batch Query + Save Result", width="stretch"):
                 _run_batch_query(query_path, result_path)
 
-            if st.button("Export History CSV", use_container_width=True):
+            if st.button("Export History CSV", width="stretch"):
                 _save_history_to_csv(history_path)
                 st.success(f"History diexport ke: {history_path}")
+
             st.markdown("</div>", unsafe_allow_html=True)
 
         with st.expander("Realtime Filters & Highlight", expanded=True):
@@ -540,7 +900,7 @@ def main() -> None:
             highlight_mode = st.radio(
                 "Highlight Mode",
                 options=["neighbors", "path", "custom selection"],
-                index=0,
+                key="ui_highlight_mode",
                 horizontal=True,
             )
 
@@ -555,22 +915,30 @@ def main() -> None:
         with st.expander("Quick Logs", expanded=False):
             st.markdown('<div class="panel-box">', unsafe_allow_html=True)
             if st.session_state.last_bfs_path:
-                st.write("BFS terakhir:", " -> ".join(st.session_state.last_bfs_path))
+                st.write("BFS terakhir:", " → ".join(st.session_state.last_bfs_path))
             if st.session_state.last_dfs_path:
-                st.write("DFS terakhir:", " -> ".join(st.session_state.last_dfs_path))
+                st.write("DFS terakhir:", " → ".join(st.session_state.last_dfs_path))
             if not st.session_state.last_bfs_path and not st.session_state.last_dfs_path:
                 st.caption("Belum ada hasil BFS/DFS di sesi ini.")
             st.markdown("</div>", unsafe_allow_html=True)
 
+    # -----------------------------------------------------------------------
+    # RIGHT COLUMN
+    # -----------------------------------------------------------------------
     with right_col:
         graph = st.session_state.graph
 
         total_nodes = graph.number_of_nodes()
         total_edges = graph.number_of_edges()
-        avg_degree = round(
-            sum(graph.in_degree(n) + graph.out_degree(n) for n in graph.nodes()) / total_nodes,
-            2,
-        ) if total_nodes else 0.0
+        avg_degree = (
+            round(
+                sum(graph.in_degree(n) + graph.out_degree(n) for n in graph.nodes())
+                / total_nodes,
+                2,
+            )
+            if total_nodes
+            else 0.0
+        )
         components = nx.number_weakly_connected_components(graph) if total_nodes else 0
 
         m1, m2, m3, m4 = st.columns(4)
@@ -586,7 +954,7 @@ def main() -> None:
             min_degree=min_degree,
             highlight_mode=highlight_mode,
             custom_nodes=custom_nodes,
-            height=380,
+            height=420,
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -594,6 +962,83 @@ def main() -> None:
             st.session_state.selected_node = clicked_node
             selected_node_value = clicked_node
 
+        # -------------------------------------------------------------------
+        # ANIMATION SECTION
+        # -------------------------------------------------------------------
+        if st.session_state.animation_steps:
+            st.markdown("---")
+            st.markdown(
+                f"### Algorithm Animation — *{st.session_state.animation_type}*"
+            )
+
+            anim_graph = st.session_state.graph
+            anim_steps = st.session_state.animation_steps
+            anim_start = st.session_state.animation_start
+            anim_end = st.session_state.animation_end
+            anim_pos = st.session_state.animation_pos
+
+            # Legend
+            legend_html = """
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px 0;">
+              <span style="background:#f59e0b;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:600;">Current</span>
+              <span style="background:#22c55e;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:600;">Visited</span>
+              <span style="background:#3b82f6;color:white;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:600;">Frontier / Stack</span>
+              <span style="background:#8b5cf6;color:white;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:600;">Start</span>
+              <span style="background:#ef4444;color:white;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:600;">End</span>
+              <span style="background:#cbd5e1;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:600;">Unvisited</span>
+            </div>
+            """
+            st.markdown(legend_html, unsafe_allow_html=True)
+
+            sp_col, btn_col = st.columns([3, 1])
+            anim_speed = sp_col.slider(
+                "Kecepatan animasi (detik/step)",
+                min_value=0.1,
+                max_value=2.0,
+                value=0.5,
+                step=0.1,
+                key="anim_speed",
+            )
+            play_anim = btn_col.button("▶ Play", type="primary", key="play_anim_btn")
+
+            step_info_placeholder = st.empty()
+            anim_placeholder = st.empty()
+
+            # Show initial (last) state by default
+            if anim_steps:
+                last_step = anim_steps[-1]
+                with step_info_placeholder.container():
+                    total = len(anim_steps)
+                    st.caption(f"Step {total}/{total}: {last_step['message']}")
+                with anim_placeholder.container():
+                    st.markdown('<div class="anim-shell">', unsafe_allow_html=True)
+                    _build_agraph_for_animation(
+                    anim_graph, last_step, anim_start, anim_end, pos=anim_pos, height=320, step_idx="initial"
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+            if play_anim:
+                for i, step in enumerate(anim_steps):
+                    with step_info_placeholder.container():
+                        progress = (i + 1) / len(anim_steps)
+                        st.progress(progress, text=f"Step {i + 1}/{len(anim_steps)}: {step['message']}")
+                    with anim_placeholder.container():
+                        st.markdown('<div class="anim-shell">', unsafe_allow_html=True)
+                        _build_agraph_for_animation(
+                        anim_graph, step, anim_start, anim_end, pos=anim_pos, height=320, step_idx=i
+                        )
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    time.sleep(anim_speed)
+
+                # After animation ends, show final step
+                with step_info_placeholder.container():
+                    st.success(
+                        f"Animasi selesai! Total {len(anim_steps)} langkah."
+                    )
+
+        # -------------------------------------------------------------------
+        # NODE DETAIL
+        # -------------------------------------------------------------------
         st.markdown("### Node Detail")
         effective_selected = st.session_state.selected_node or selected_node_value
         if effective_selected and graph.has_node(effective_selected):
@@ -621,13 +1066,25 @@ def main() -> None:
         )
 
         with st.expander("Nodes (preview)", expanded=False):
-            st.dataframe(nodes_df if not nodes_df.empty else pd.DataFrame({"info": ["kosong"]}), use_container_width=True)
+            st.dataframe(
+                nodes_df if not nodes_df.empty else pd.DataFrame({"info": ["kosong"]}),
+                width="stretch",
+            )
         with st.expander("Edges Directed (preview)", expanded=False):
-            st.dataframe(edges_df if not edges_df.empty else pd.DataFrame({"info": ["kosong"]}), use_container_width=True)
+            st.dataframe(
+                edges_df if not edges_df.empty else pd.DataFrame({"info": ["kosong"]}),
+                width="stretch",
+            )
         with st.expander("Results (preview)", expanded=False):
-            st.dataframe(result_df if not result_df.empty else pd.DataFrame({"info": ["kosong"]}), use_container_width=True)
+            st.dataframe(
+                result_df if not result_df.empty else pd.DataFrame({"info": ["kosong"]}),
+                width="stretch",
+            )
         with st.expander("History (preview)", expanded=False):
-            st.dataframe(history_df if not history_df.empty else pd.DataFrame({"info": ["kosong"]}), use_container_width=True)
+            st.dataframe(
+                history_df if not history_df.empty else pd.DataFrame({"info": ["kosong"]}),
+                width="stretch",
+            )
 
 
 if __name__ == "__main__":

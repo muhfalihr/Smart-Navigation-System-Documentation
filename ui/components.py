@@ -132,13 +132,13 @@ def render_data_expanders(bundle: DataBundle) -> None:
     st.subheader("Data Explorer")
 
     with st.expander("Query Data (data/query.csv)", expanded=False):
-        st.dataframe(_safe_table(bundle.query_df), use_container_width=True)
+        st.dataframe(_safe_table(bundle.query_df), width="stretch")
 
     with st.expander("Result Data (output/result.csv)", expanded=False):
-        st.dataframe(_safe_table(bundle.result_df), use_container_width=True)
+        st.dataframe(_safe_table(bundle.result_df), width="stretch")
 
     with st.expander("History Data (output/history.csv)", expanded=False):
-        st.dataframe(_safe_table(bundle.history_df), use_container_width=True)
+        st.dataframe(_safe_table(bundle.history_df), width="stretch")
 
 
 def render_warnings(warnings: list[str]) -> None:
