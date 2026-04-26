@@ -1,6 +1,6 @@
-from,to
-A,B
-A,D
-B,C
-B,E
-D,E
+from,to,distance,time
+A,B,16.8,20.7
+A,D,4.3,22.0
+B,C,6.6,54.1
+B,E,9.5,35.8
+D,E,19.2,38.0

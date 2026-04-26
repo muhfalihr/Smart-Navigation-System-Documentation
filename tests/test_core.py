@@ -34,19 +34,19 @@ class TestNavigationService(unittest.TestCase):
         self.service = NavigationService()
 
     def test_bfs_found(self):
-        path = self.service.bfs_shortest_path(self.graph, "A", "E")
+        path, d, t = self.service.find_optimal_path(self.graph, "A", "E")
         self.assertEqual(path, ["A", "B", "E"])
-        self.assertEqual(len(path) - 1, 2)
+        self.assertEqual(d, 2.0)
 
     def test_bfs_invalid_node(self):
-        path = self.service.bfs_shortest_path(self.graph, "A", "Z")
+        path, d, t = self.service.find_optimal_path(self.graph, "A", "Z")
         self.assertEqual(path, [])
 
     def test_bfs_not_found(self):
         disconnected = Graph()
         disconnected.add_edge("A", "B")
         disconnected.add_edge("C", "D")
-        path = self.service.bfs_shortest_path(disconnected, "A", "D")
+        path, d, t = self.service.find_optimal_path(disconnected, "A", "D")
         self.assertEqual(path, [])
 
     def test_dfs(self):
@@ -89,13 +89,14 @@ class TestCsvIO(unittest.TestCase):
                 history_rows = list(csv.DictReader(file))
 
             self.assertEqual(result_rows[0]["path"], "A-B-C")
-            self.assertEqual(result_rows[0]["distance"], "2")
+            self.assertEqual(result_rows[0]["distance"], "0.0")
+            self.assertEqual(result_rows[0]["time"], "0.0")
             self.assertEqual(history_rows[0]["no"], "1")
             self.assertEqual(history_rows[0]["path"], "A-B-C")
 
     def test_query_result_distance(self):
-        result = QueryResult(start="A", end="C", path=["A", "B", "C"])
-        self.assertEqual(result.distance, 2)
+        result = QueryResult(start="A", end="C", path=["A", "B", "C"], total_distance=2.0, total_time=3.0)
+        self.assertEqual(result.distance, 2.0)
 
 
 if __name__ == "__main__":
